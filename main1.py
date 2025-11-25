@@ -138,7 +138,7 @@ def run_task_2_scienceqa():
     test_samples = dataset_with_img.select(indices)
 
     # 4. 加载模型 (指定 Qwen2-VL-7B-Instruct) [cite: 12]
-    model_name = "Qwen/Qwen2-VL-7B-Instruct"
+    model_name = "/root/autodl-tmp/models/Qwen2-VL-7B-Instruct"
     print(f"正在加载模型: {model_name} (4-bit)...")
 
     bnb_config = BitsAndBytesConfig(
