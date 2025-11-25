@@ -1,307 +1,232 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from datasets import load_dataset
 import re
 import random
 import numpy as np
-from tqdm import tqdm
-import warnings
-warnings.filterwarnings("ignore")
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from qwen_vl_utils import process_vision_info
 
-# 设置随机种子以保证可重复性
+# 设置随机种子以保证结果可复现
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    torch.cuda.manual_seed_all(seed)
 
 set_seed(42)
 
-class GSM8KEvaluator:
-    def __init__(self, model_name="Qwen/Qwen2.5-7B-Instruct", quantize_4bit=True):
-        """
-        初始化GSM8K评测器
-        
-        Args:
-            model_name: 模型名称
-            quantize_4bit: 是否使用4-bit量化
-        """
-        self.model_name = model_name
-        self.quantize_4bit = quantize_4bit
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-        print(f"正在加载模型: {model_name}")
-        print(f"设备: {self.device}")
-        print(f"4-bit量化: {quantize_4bit}")
-        
-        # 配置4-bit量化
-        if quantize_4bit:
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-            )
-        else:
-            quantization_config = None
-        
-        # 加载tokenizer和模型
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            quantization_config=quantization_config,
-            device_map="auto",
-            torch_dtype=torch.float16,
-            trust_remote_code=True
-        )
-        
-        # 添加pad_token如果不存在
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        
-        print("模型加载完成!")
-    
-    def extract_answer(self, text):
-        """
-        从模型输出中提取最终答案
-        
-        Args:
-            text: 模型生成的文本
-            
-        Returns:
-            extracted_answer: 提取的数字答案
-        """
-        # 多种模式匹配最终答案
-        patterns = [
-            r'####\s*(\-?\d+(?:\.\d+)?)',  # #### 123
-            r'答案\s*[:：]\s*(\-?\d+(?:\.\d+)?)',  # 答案: 123
-            r'答案是\s*(\-?\d+(?:\.\d+)?)',  # 答案是123
-            r'[Tt]he answer is\s*(\-?\d+(?:\.\d+)?)',  # The answer is 123
-            r'[Ff]inal answer\s*[:：]?\s*(\-?\d+(?:\.\d+)?)',  # Final answer: 123
-            r'(\-?\d+(?:\.\d+)?)\s*$'  # 行末的数字
-        ]
-        
-        for pattern in patterns:
-            matches = re.findall(pattern, text)
-            if matches:
-                # 返回最后一个匹配，因为通常最终答案在最后
-                return matches[-1]
-        
-        # 如果没有匹配到特定模式，尝试提取所有数字并返回最后一个
-        numbers = re.findall(r'\-?\d+(?:\.\d+)?', text)
-        if numbers:
-            return numbers[-1]
-        
-        return None
-    
-    def extract_ground_truth(self, answer_text):
-        """
-        从数据集的answer字段提取真实答案
-        
-        Args:
-            answer_text: 数据集的answer字段文本
-            
-        Returns:
-            ground_truth: 真实答案
-        """
-        # GSM8K数据集的答案格式通常是：推理过程 #### 数字答案
-        match = re.search(r'####\s*(\-?\d+(?:\.\d+)?)', answer_text)
-        if match:
-            return match.group(1)
-        return None
-    
-    def generate_response(self, question, max_length=1024):
-        """
-        生成模型的回答
-        
-        Args:
-            question: 数学问题
-            max_length: 最大生成长度
-            
-        Returns:
-            response: 模型生成的完整回答
-        """
-        # 构建prompt
-        prompt = f"请解决以下数学问题，并给出详细的推理过程。在最后一行用####标注最终答案。\n\n问题：{question}\n\n解答："
-        
-        # 编码输入
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        # 生成回答
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=max_length,
-                num_return_sequences=1,
-                temperature=0.1,
-                do_sample=False,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-        
-        # 解码生成文本
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # 只返回生成的部分（去掉prompt）
-        generated_text = response[len(prompt):].strip()
-        
-        return generated_text
-    
-    def evaluate(self, num_samples=50):
-        """
-        在GSM8K测试集上进行评测
-        
-        Args:
-            num_samples: 评测样本数量
-            
-        Returns:
-            results: 评测结果字典
-        """
-        print(f"正在加载GSM8K测试集并随机抽取{num_samples}条数据...")
-        
-        # 加载数据集
-        dataset = load_dataset("openai/gsm8k", "main", split="test")
-        
-        # 随机抽样
-        if len(dataset) > num_samples:
-            indices = random.sample(range(len(dataset)), num_samples)
-            test_samples = dataset.select(indices)
-        else:
-            test_samples = dataset
-        
-        print(f"成功加载{len(test_samples)}个测试样本")
-        
-        results = {
-            'total': len(test_samples),
-            'correct': 0,
-            'accuracy': 0.0,
-            'details': []
-        }
-        
-        print("开始评测...")
-        for i, sample in enumerate(tqdm(test_samples, desc="评测进度")):
-            question = sample['question']
-            ground_truth_answer = self.extract_ground_truth(sample['answer'])
-            
-            if ground_truth_answer is None:
-                print(f"警告: 无法从样本{i}提取真实答案")
-                continue
-            
-            try:
-                # 生成模型回答
-                model_response = self.generate_response(question)
-                
-                # 提取模型答案
-                model_answer = self.extract_answer(model_response)
-                
-                # 检查答案是否正确
-                is_correct = False
-                if model_answer is not None:
-                    # 尝试将答案转换为浮点数进行比较
-                    try:
-                        model_float = float(model_answer)
-                        truth_float = float(ground_truth_answer)
-                        # 允许小的浮点数误差
-                        is_correct = abs(model_float - truth_float) < 1e-6
-                    except ValueError:
-                        # 如果转换失败，进行字符串比较
-                        is_correct = (model_answer.strip() == ground_truth_answer.strip())
-                
-                if is_correct:
-                    results['correct'] += 1
-                
-                # 保存详细信息
-                results['details'].append({
-                    'question': question,
-                    'ground_truth': ground_truth_answer,
-                    'model_response': model_response,
-                    'model_answer': model_answer,
-                    'is_correct': is_correct
-                })
-                
-            except Exception as e:
-                print(f"处理样本{i}时出错: {e}")
-                results['details'].append({
-                    'question': question,
-                    'ground_truth': ground_truth_answer,
-                    'model_response': f"Error: {e}",
-                    'model_answer': None,
-                    'is_correct': False
-                })
-        
-        # 计算准确率
-        results['accuracy'] = results['correct'] / results['total']
-        
-        return results
-    
-    def print_results(self, results):
-        """
-        打印评测结果
-        
-        Args:
-            results: 评测结果字典
-        """
-        print("\n" + "="*80)
-        print("GSM8K数学推理评测结果")
-        print("="*80)
-        print(f"模型: {self.model_name}")
-        print(f"测试样本数: {results['total']}")
-        print(f"正确回答数: {results['correct']}")
-        print(f"准确率: {results['accuracy']:.4f} ({results['accuracy']*100:.2f}%)")
-        print("="*80)
-        
-        # 打印前5个样本的详细信息
-        print("\n前5个样本的详细结果:")
-        print("-"*80)
-        
-        for i, detail in enumerate(results['details'][:5]):
-            print(f"\n样本 {i+1}:")
-            print(f"问题: {detail['question']}")
-            print(f"真实答案: {detail['ground_truth']}")
-            print(f"模型答案: {detail['model_answer']}")
-            print(f"模型回答: {detail['model_response'][:200]}...")
-            print(f"是否正确: {'✓' if detail['is_correct'] else '✗'}")
-            print("-"*80)
+# ==========================================
+# 任务一: LLM 数学推理评测 (GSM8K)
+# ==========================================
+def run_task_1_gsm8k():
+    print("\n" + "="*50)
+    print("开始任务一：GSM8K 数学推理评测")
+    print("="*50)
 
-def main():
-    """
-    主函数：执行GSM8K评测任务
-    """
-    # 模型选择
-    model_name = "Qwen/Qwen2.5-7B-Instruct"
+    # 1. 加载数据集 [cite: 5]
+    print("正在加载 GSM8K 数据集...")
+    try:
+        dataset = load_dataset("openai/gsm8k", "main", split="test")
+    except Exception as e:
+        print(f"加载数据集失败，请检查网络: {e}")
+        return
+
+    # 2. 随机抽取 50 条 [cite: 6]
+    indices = random.sample(range(len(dataset)), 50)
+    test_samples = dataset.select(indices)
     
-    # 初始化评测器
-    evaluator = GSM8KEvaluator(model_name=model_name, quantize_4bit=True)
+    # 3. 加载模型 (推荐 Qwen2.5-7B-Instruct 用于纯文本任务) [cite: 7]
+    # 使用 4-bit 量化以节省显存 
+    model_name = "Qwen/Qwen2.5-7B-Instruct" 
+    print(f"正在加载模型: {model_name} (4-bit)...")
     
-    # 模型结构说明
-    print("\n" + "="*80)
-    print("模型结构说明 (基于Qwen2.5-7B-Instruct原论文)")
-    print("="*80)
-    print("1. 架构: Transformer解码器架构")
-    print("2. 参数量: 7B (70亿参数)")
-    print("3. 上下文长度: 32K tokens")
-    print("4. 注意力机制: Group Query Attention (GQA)")
-    print("5. 位置编码: Rotary Position Embedding (RoPE)")
-    print("6. 激活函数: SwiGLU")
-    print("7. 归一化: RMSNorm")
-    print("8. 词汇表大小: 152,064")
-    print("="*80)
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto",
+        quantization_config=bnb_config,
+        trust_remote_code=True
+    )
+
+    correct_count = 0
+    total_count = len(test_samples)
+
+    print("开始推理...")
+    for i, sample in enumerate(test_samples):
+        question = sample['question']
+        ground_truth_str = sample['answer'] # 格式通常包含推理过程和 #### 答案
+        
+        # 提取 Ground Truth 数值 (通常在 #### 之后)
+        ground_truth_val = ground_truth_str.split("####")[-1].strip()
+        
+        # 构建 Prompt
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant. Solve the math problem step by step. Finally, output the answer strictly in the format: #### Number"},
+            {"role": "user", "content": question}
+        ]
+        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+
+        # 生成回答
+        generated_ids = model.generate(
+            **model_inputs,
+            max_new_tokens=512,
+            temperature=0.01 # 降低随机性
+        )
+        generated_ids = [
+            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+        ]
+        response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+        # 提取模型预测的答案
+        # 尝试寻找 #### 后的数字，如果没有则尝试寻找最后一个数字
+        pred_match = re.search(r'####\s*(-?[\d,]+(?:\.\d+)?)', response)
+        if pred_match:
+            pred_val = pred_match.group(1).replace(',', '')
+        else:
+            # Fallback: 找最后一个数字
+            all_nums = re.findall(r'-?[\d,]+(?:\.\d+)?', response)
+            pred_val = all_nums[-1].replace(',', '') if all_nums else "Error"
+
+        # 对比 (简单的字符串对比，也可以转float对比)
+        is_correct = False
+        try:
+            if float(pred_val) == float(ground_truth_val):
+                is_correct = True
+        except:
+            pass
+            
+        if is_correct:
+            correct_count += 1
+
+        print(f"[{i+1}/{total_count}] | GT: {ground_truth_val} | Pred: {pred_val} | {'Correct' if is_correct else 'Wrong'}")
+
+    accuracy = correct_count / total_count
+    print(f"\n任务一 GSM8K 准确率: {accuracy:.2%} ({correct_count}/{total_count})")
     
-    # 进行评测
-    results = evaluator.evaluate(num_samples=50)
+    # 清理显存
+    del model
+    del tokenizer
+    torch.cuda.empty_cache()
+
+# ==========================================
+# 任务二: MLLM 多模态科学问答 (ScienceQA)
+# ==========================================
+def run_task_2_scienceqa():
+    print("\n" + "="*50)
+    print("开始任务二：ScienceQA 多模态问答")
+    print("="*50)
+
+    # 1. 加载数据集 [cite: 9]
+    print("正在加载 ScienceQA 数据集...")
+    dataset = load_dataset("derek-thomas/ScienceQA", split="test")
+
+    # 2. 筛选包含图片的数据 [cite: 10]
+    # ScienceQA 的 image 字段如果不是 None 则是 PIL Image 对象
+    dataset_with_img = dataset.filter(lambda x: x['image'] is not None)
     
-    # 打印结果
-    evaluator.print_results(results)
+    # 3. 随机抽取 50 条 [cite: 11]
+    # 注意：如果筛选后数量不足50，则取全部
+    sample_size = min(50, len(dataset_with_img))
+    indices = random.sample(range(len(dataset_with_img)), sample_size)
+    test_samples = dataset_with_img.select(indices)
+
+    # 4. 加载模型 (指定 Qwen2-VL-7B-Instruct) [cite: 12]
+    model_name = "Qwen/Qwen2-VL-7B-Instruct"
+    print(f"正在加载模型: {model_name} (4-bit)...")
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16
+    )
+
+    # Qwen2-VL 需要特定的 processor
+    from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
     
-    # 保存详细结果到文件
-    import json
-    with open('gsm8k_results.json', 'w', encoding='utf-8') as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+    model = Qwen2VLForConditionalGeneration.from_pretrained(
+        model_name, 
+        torch_dtype="auto",
+        device_map="auto",
+        quantization_config=bnb_config,
+        trust_remote_code=True
+    )
     
-    print(f"\n详细结果已保存到: gsm8k_results.json")
+    # 这里的 min_pixels 和 max_pixels 可以根据显存调整
+    processor = AutoProcessor.from_pretrained(model_name, min_pixels=256*28*28, max_pixels=1280*28*28)
+
+    correct_count = 0
+    total_count = len(test_samples)
+
+    print("开始推理...")
+    for i, sample in enumerate(test_samples):
+        question = sample['question']
+        choices = sample['choices'] # List of strings
+        answer_idx = sample['answer'] # Int: 0, 1, 2...
+        image = sample['image'] # PIL Image
+
+        # 将数字索引转换为选项字母 (0->A, 1->B...)
+        options_map = {k: v for k, v in enumerate(['A', 'B', 'C', 'D', 'E'])}
+        ground_truth_opt = options_map[answer_idx]
+
+        # 格式化选项文本
+        choices_str = "\n".join([f"{options_map[idx]}. {choice}" for idx, choice in enumerate(choices)])
+        
+        # 构建 Prompt [cite: 13]
+        prompt_text = f"Question: {question}\nOptions:\n{choices_str}\nAnswer with the option letter directly."
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt_text},
+                ],
+            }
+        ]
+
+        # 准备输入
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = inputs.to(model.device)
+
+        # 生成
+        generated_ids = model.generate(**inputs, max_new_tokens=128)
+        generated_ids_trimmed = [
+            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        response = processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0]
+
+        # 提取答案 (通常模型会直接输出 "A" 或者 "The answer is A")
+        # 简单提取第一个出现的 A-E 字母
+        match = re.search(r'([A-E])', response)
+        pred_opt = match.group(1) if match else "None"
+
+        is_correct = (pred_opt == ground_truth_opt)
+        if is_correct:
+            correct_count += 1
+            
+        print(f"[{i+1}/{total_count}] | GT: {ground_truth_opt} | Pred: {pred_opt} | {'Correct' if is_correct else 'Wrong'}")
+
+    accuracy = correct_count / total_count
+    print(f"\n任务二 ScienceQA 准确率: {accuracy:.2%} ({correct_count}/{total_count})")
 
 if __name__ == "__main__":
-    main()
+    # 按顺序执行任务
+    run_task_1_gsm8k()
+    run_task_2_scienceqa()
