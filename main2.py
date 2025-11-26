@@ -3,13 +3,12 @@ import re
 import random
 import numpy as np
 from datasets import load_dataset
-# === 修复点：导入 PIL 库中的 Image 类 ===
-from PIL import Image
-# ========================================
+from PIL import Image # 【修复点一：确保 Image 导入】
 from transformers import (
     AutoProcessor,
     AutoModelForVision2Seq,
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
+    # Qwen2VLForConditionalGeneration, # 实际上 Qwen2-VL 推荐使用这个，但我们保留 AutoModelForVision2Seq 以兼容您当前的导入
 )
 from qwen_vl_utils import process_vision_info
 
@@ -55,6 +54,7 @@ def run_task_2_scienceqa():
     model_path = "/root/autodl-tmp/models/Qwen2-VL-7B-Instruct"
     print(f"[3/5] 正在加载 4-bit 模型：{model_path}")
 
+    # 使用 bfloat16 进行 4-bit 计算，通常更稳定
     quant_cfg = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
@@ -63,7 +63,6 @@ def run_task_2_scienceqa():
     )
 
     try:
-        # 注意：AutoModelForVision2Seq已被警告弃用，但为了与您现有代码兼容，暂不更改。
         model = AutoModelForVision2Seq.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
@@ -75,7 +74,7 @@ def run_task_2_scienceqa():
         processor = AutoProcessor.from_pretrained(
             model_path,
             trust_remote_code=True,
-            use_fast=False,
+            use_fast=False, # 确保使用兼容的慢速处理器
         )
     except Exception as e:
         print(f"模型加载失败：{e}")
@@ -98,49 +97,58 @@ def run_task_2_scienceqa():
 
         gt = options_map[correct_idx]
 
-        # 1. 构造 prompt
+        # 1. 构造 Prompt
         choices_str = "\n".join([f"{options_map[i]}. {c}" for i, c in enumerate(choices)])
-        prompt = (
+        prompt_text = (
             f"Question: {question}\n"
             f"Options:\n{choices_str}\n"
-            f"Answer with the option letter (A/B/C/D)."
+            "Answer with the option letter directly (A/B/C/D)."
         )
 
-        # 2. 构建文本输入
-        text = prompt  # 直接将 prompt 作为文本输入
+        # 2. 【关键修复点】：构建 Qwen2-VL 专用的多模态输入格式 (Messages)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image.convert("RGB")}, # 确保图片是 RGB 格式
+                    {"type": "text", "text": prompt_text},
+                ],
+            }
+        ]
+        
+        # 3. 使用 Processor 的聊天模板，生成包含图片占位符的文本
+        # text 现在包含 [img] ... [/img] 或其他占位符
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        
+        # 4. 使用 qwen_vl_utils 辅助处理视觉信息，提取图像输入
+        image_inputs, video_inputs = process_vision_info(messages)
 
-        # 3. 确保图像格式是 PIL，并且尺寸符合模型要求
-        # 此处的 Image.Image 检查依赖于上述的 'from PIL import Image'
-        if isinstance(image, Image.Image):
-            image = image.convert("RGB")  # 确保图像是 RGB 格式
-        else:
-            print(f"警告：图像格式不正确，正在跳过样本 {idx+1}")
-            continue
-
-        # 4. 使用 processor 处理文本和图像
+        # 5. 最终处理文本和图像，生成Inputs Tensor
         inputs = processor(
-            text=[text],  # 单个文本输入
-            images=[image],  # 图像输入必须是列表格式
-            return_tensors="pt"
+            text=[text],
+            images=image_inputs, # 使用提取出的图像输入
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
         ).to(model.device)
 
-        # 5. 生成结果
+        # 6. 生成结果
         output_ids = model.generate(**inputs, max_new_tokens=64)
 
-        # 6. 解码生成的 token
+        # 7. 解码生成的 token
         response = processor.batch_decode(
             output_ids,
             skip_special_tokens=True
         )[0]
 
-        # 7. 正则提取预测答案
+        # 8. 正则提取预测答案
         match = re.search(r"\b([A-E])\b", response)
         pred = match.group(1) if match else "None"
 
         if pred == gt:
             correct += 1
 
-        print(f"Sample {idx+1:02d} | GT: {gt} | Pred: {pred} | {'correct' if pred == gt else 'wrong'}")
+        print(f"Sample {idx+1:02d} | GT: {gt} | Pred: {pred} | {' correct' if pred == gt else ' wrong'}")
 
     # ------------------------------------------------------------
     # Step 4: 结果统计
