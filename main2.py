@@ -52,7 +52,7 @@ def run_task_2_scienceqa():
     # ----------------------------------------------------------------
     # Step 2: 模型加载 (Pipeline: Load Model & Processor in 4-bit)
     # ----------------------------------------------------------------
-    model_name = "Qwen/Qwen2-VL-7B-Instruct" # [cite: 12]
+    model_name = "/root/autodl-tmp/models/Qwen2-VL-7B-Instruct" # [cite: 12]
     print(f"[3/5] 正在加载模型: {model_name} (4-bit 量化)...")
 
     # 配置 4-bit 量化参数 
