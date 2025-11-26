@@ -94,18 +94,15 @@ def run_task_2_scienceqa():
 
         gt = options_map[correct_idx]
 
-        # 格式化选项
+        # 1. 构造 prompt
         choices_str = "\n".join([f"{options_map[i]}. {c}" for i, c in enumerate(choices)])
-
         prompt = (
             f"Question: {question}\n"
             f"Options:\n{choices_str}\n"
             f"Answer with the option letter (A/B/C/D)."
         )
 
-        # ---------------------
-        # 构建 Qwen2-VL 消息格式
-        # ---------------------
+        # 2. Qwen2-VL 正确消息格式
         messages = [
             {
                 "role": "user",
@@ -116,33 +113,29 @@ def run_task_2_scienceqa():
             }
         ]
 
-        # vision 信息
-        vision_inputs = process_vision_info(messages)
-
-        # 处理输入
+        # 3. 正确 processor 调用（不能自己传 images=）
         inputs = processor(
-            messages,
-            images=vision_inputs[0],
-            videos=vision_inputs[1],
+            messages=messages,
             return_tensors="pt"
         ).to(model.device)
 
-        # 模型生成
-        generated_ids = model.generate(**inputs, max_new_tokens=64)
+        # 4. 生成
+        output_ids = model.generate(**inputs, max_new_tokens=64)
 
         response = processor.batch_decode(
-            generated_ids,
+            output_ids,
             skip_special_tokens=True
         )[0]
 
-        # 正则提取结果
+        # 5. 正则提取预测答案
         match = re.search(r"\b([A-E])\b", response)
         pred = match.group(1) if match else "None"
 
         if pred == gt:
             correct += 1
 
-        print(f"Sample {idx+1:02d} | GT: {gt} | Pred: {pred} | {'✔' if pred == gt else '✘'}")
+        print(f"Sample {idx+1:02d} | GT: {gt} | Pred: {pred} | {'correct' if pred == gt else 'wrong'}")
+
 
     # ------------------------------------------------------------
     # Step 4: 结果统计
