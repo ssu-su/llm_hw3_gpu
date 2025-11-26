@@ -3,172 +3,156 @@ import re
 import random
 import numpy as np
 from datasets import load_dataset
-# 导入所需的类：Qwen2VL专用的模型和处理器
-from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor, BitsAndBytesConfig
-from qwen_vl_utils import process_vision_info # 导入处理多模态输入的工具
+from transformers import (
+    AutoProcessor,
+    AutoModelForVision2Seq,
+    BitsAndBytesConfig
+)
+from qwen_vl_utils import process_vision_info
+
 
 # ==========================================
 # 配置与初始化
 # ==========================================
 def set_seed(seed=42):
-    """设置随机种子以保证结果可复现"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-# 设置随机种子，确保每次抽取的 50 条数据一致
 set_seed(42)
 
-# ==========================================
-# 任务二: MLLM 多模态科学问答 (ScienceQA)
-# ==========================================
+
 def run_task_2_scienceqa():
     print("\n" + "="*60)
-    print("开始任务二：ScienceQA 多模态科学问答评测 (Qwen2-VL-7B)")
+    print("任务二：ScienceQA 多模态科学问答 (Qwen2-VL-7B)")
     print("="*60)
 
-    # ----------------------------------------------------------------
-    # Step 1: 数据准备 (Load -> Filter -> Sample)
-    # ----------------------------------------------------------------
-    print("[1/4] 正在加载 ScienceQA 测试数据集...")
-    try:
-        dataset = load_dataset("derek-thomas/ScienceQA", split="test")
-    except Exception as e:
-        print(f"数据加载失败，请检查网络连接: {e}")
-        return
+    # ------------------------------------------------------------
+    # Step 1: 加载数据集
+    # ------------------------------------------------------------
+    print("[1/5] 正在加载 ScienceQA 数据集...")
+    dataset = load_dataset("derek-thomas/ScienceQA", split="test")
 
-    # 筛选包含图片的数据 (image 字段不为 None)
-    print("[2/4] 正在筛选包含图片的样本并随机抽取 50 条...")
+    print("[2/5] 正在筛选包含图片的样本...")
     dataset_with_img = dataset.filter(lambda x: x['image'] is not None)
-    
-    # 随机抽取 50 条数据
+
+    # 随机 50 条
     sample_size = 50
-    if len(dataset_with_img) < sample_size:
-        print(f"警告：带图片样本不足 {sample_size} 条，使用全部 {len(dataset_with_img)} 条。")
+    if len(dataset_with_img) < 50:
         sample_size = len(dataset_with_img)
-    
-    indices = random.sample(range(len(dataset_with_img)), sample_size)
-    test_samples = dataset_with_img.select(indices)
-    
-    total_count = len(test_samples)
-    print(f"已抽取 {total_count} 条带图片的测试样本。")
 
+    test_samples = dataset_with_img.shuffle(seed=42).select(range(sample_size))
+    print(f"已抽取 {sample_size} 条带图片样本。")
 
-    # ----------------------------------------------------------------
-    # Step 2: 模型加载 (Load Model & Processor from local path in 4-bit)
-    # ----------------------------------------------------------------
-    # 【注意】这里使用用户指定的本地路径，如果文件不完整可能仍会出错
-    model_name = "/root/autodl-tmp/models/Qwen2-VL-7B-Instruct" 
-    print(f"[3/4] 正在加载本地模型: {model_name} (4-bit 量化)...")
+    # ------------------------------------------------------------
+    # Step 2: 加载模型（4-bit）
+    # ------------------------------------------------------------
+    model_path = "/root/autodl-tmp/models/Qwen2-VL-7B-Instruct"
+    print(f"[3/5] 正在加载 4-bit 模型：{model_path}")
 
-    # 配置 4-bit 量化参数
-    bnb_config = BitsAndBytesConfig(
+    quant_cfg = BitsAndBytesConfig(
         load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16
+        bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
     try:
-        # 加载多模态模型 (权重)
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_name, 
-            torch_dtype="auto",
+        model = AutoModelForVision2Seq.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
             device_map="auto",
-            quantization_config=bnb_config,
+            quantization_config=quant_cfg,
             trust_remote_code=True
         )
-        
-        # 【关键修复】：直接使用 Qwen2VLProcessor 确保配置加载正确
-        processor = Qwen2VLProcessor.from_pretrained(
-            model_name, 
-            min_pixels=256*28*28, 
-            max_pixels=1280*28*28 # 限制分辨率以控制显存
+
+        processor = AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            use_fast=False,
         )
     except Exception as e:
-        print(f"\n模型或处理器加载失败，请检查本地路径文件是否完整: {e}")
+        print(f"模型加载失败：{e}")
         return
 
-    # ----------------------------------------------------------------
-    # Step 3: 推理循环 (Inference -> Extract)
-    # ----------------------------------------------------------------
-    correct_count = 0
-    options_map = {0: 'A', 1: 'B', 2: 'C', 3: 'D', 4: 'E'}
+    # ------------------------------------------------------------
+    # Step 3: 推理
+    # ------------------------------------------------------------
+    print("[4/5] 开始推理 ...")
+    correct = 0
+    total = len(test_samples)
 
-    print(f"\n[4/4] 开始推理 (共 {total_count} 条)...")
-    print("-" * 60)
+    options_map = {0: "A", 1: "B", 2: "C", 3: "D", 4: "E"}
 
-    for i, sample in enumerate(test_samples):
-        # 1. 准备数据
-        question = sample['question']
-        choices = sample['choices'] 
-        answer_idx = sample['answer'] 
-        image = sample['image'] 
-        
-        ground_truth = options_map.get(answer_idx, "Unknown")
-        
-        # 2. 构建 Prompt
-        choices_str = "\n".join([f"{options_map[idx]}. {c}" for idx, c in enumerate(choices)])
-        
-        prompt_text = (
+    for idx, sample in enumerate(test_samples):
+        question = sample["question"]
+        choices = sample["choices"]
+        correct_idx = sample["answer"]
+        image = sample["image"]
+
+        gt = options_map[correct_idx]
+
+        # 格式化选项
+        choices_str = "\n".join([f"{options_map[i]}. {c}" for i, c in enumerate(choices)])
+
+        prompt = (
             f"Question: {question}\n"
             f"Options:\n{choices_str}\n"
-            "Answer with the option letter directly (e.g., A, B, C, D)."
+            f"Answer with the option letter (A/B/C/D)."
         )
 
-        # Qwen2-VL 的多模态消息格式
+        # ---------------------
+        # 构建 Qwen2-VL 消息格式
+        # ---------------------
         messages = [
             {
                 "role": "user",
                 "content": [
                     {"type": "image", "image": image},
-                    {"type": "text", "text": prompt_text},
+                    {"type": "text", "text": prompt},
                 ],
             }
         ]
 
-        # 3. 处理输入 (Image + Text)
-        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
-        inputs = inputs.to(model.device)
+        # vision 信息
+        vision_inputs = process_vision_info(messages)
 
-        # 4. 模型生成
+        # 处理输入
+        inputs = processor(
+            messages,
+            images=vision_inputs[0],
+            videos=vision_inputs[1],
+            return_tensors="pt"
+        ).to(model.device)
+
+        # 模型生成
         generated_ids = model.generate(**inputs, max_new_tokens=64)
-        
-        generated_ids_trimmed = [
-            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
+
         response = processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            generated_ids,
+            skip_special_tokens=True
         )[0]
 
-        # 5. 提取答案
-        match = re.search(r'([A-E])', response.strip())
-        prediction = match.group(1) if match else "None"
+        # 正则提取结果
+        match = re.search(r"\b([A-E])\b", response)
+        pred = match.group(1) if match else "None"
 
-        # 6. 对比结果
-        is_correct = (prediction == ground_truth)
-        if is_correct:
-            correct_count += 1
-            
-        print(f"Sample {i+1:02d}/{total_count} | GT: {ground_truth} | Pred: {prediction} | {'✅ Correct' if is_correct else '❌ Wrong'}")
+        if pred == gt:
+            correct += 1
 
-    # ----------------------------------------------------------------
+        print(f"Sample {idx+1:02d} | GT: {gt} | Pred: {pred} | {'✔' if pred == gt else '✘'}")
+
+    # ------------------------------------------------------------
     # Step 4: 结果统计
-    # ----------------------------------------------------------------
-    accuracy = correct_count / total_count
+    # ------------------------------------------------------------
+    acc = correct / total
     print("-" * 60)
-    print(f"评测结束")
-    print(f"最终准确率 (Accuracy): {accuracy:.2%} ({correct_count}/{total_count})")
+    print("[5/5] 评测结束")
+    print(f"最终准确率: {acc:.2%} ({correct}/{total})")
     print("-" * 60)
+
 
 if __name__ == "__main__":
     run_task_2_scienceqa()
