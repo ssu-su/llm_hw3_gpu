@@ -102,32 +102,26 @@ def run_task_2_scienceqa():
             f"Answer with the option letter (A/B/C/D)."
         )
 
-        # 2. Qwen2-VL 正确消息格式
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ]
+        # 2. 构建文本输入
+        text = prompt  # 直接将 prompt 作为文本输入
 
-        # 3. 正确 processor 调用（不能自己传 images=）
+        # 3. 使用 processor 处理文本和图片
         inputs = processor(
-            messages=messages,
+            text=[text],  # 单个文本输入
+            images=[image],  # 图像输入必须是列表格式
             return_tensors="pt"
         ).to(model.device)
 
-        # 4. 生成
+        # 4. 生成结果
         output_ids = model.generate(**inputs, max_new_tokens=64)
 
+        # 5. 解码生成的 token
         response = processor.batch_decode(
             output_ids,
             skip_special_tokens=True
         )[0]
 
-        # 5. 正则提取预测答案
+        # 6. 正则提取预测答案
         match = re.search(r"\b([A-E])\b", response)
         pred = match.group(1) if match else "None"
 
