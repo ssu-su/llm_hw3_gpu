@@ -105,23 +105,30 @@ def run_task_2_scienceqa():
         # 2. 构建文本输入
         text = prompt  # 直接将 prompt 作为文本输入
 
-        # 3. 使用 processor 处理文本和图片
+        # 3. 确保图像格式是 PIL，并且尺寸符合模型要求
+        if isinstance(image, Image.Image):
+            image = image.convert("RGB")  # 确保图像是 RGB 格式
+        else:
+            print(f"警告：图像格式不正确，正在跳过样本 {idx+1}")
+            continue
+
+        # 4. 使用 processor 处理文本和图像
         inputs = processor(
             text=[text],  # 单个文本输入
             images=[image],  # 图像输入必须是列表格式
             return_tensors="pt"
         ).to(model.device)
 
-        # 4. 生成结果
+        # 5. 生成结果
         output_ids = model.generate(**inputs, max_new_tokens=64)
 
-        # 5. 解码生成的 token
+        # 6. 解码生成的 token
         response = processor.batch_decode(
             output_ids,
             skip_special_tokens=True
         )[0]
 
-        # 6. 正则提取预测答案
+        # 7. 正则提取预测答案
         match = re.search(r"\b([A-E])\b", response)
         pred = match.group(1) if match else "None"
 
@@ -129,7 +136,6 @@ def run_task_2_scienceqa():
             correct += 1
 
         print(f"Sample {idx+1:02d} | GT: {gt} | Pred: {pred} | {'correct' if pred == gt else 'wrong'}")
-
 
     # ------------------------------------------------------------
     # Step 4: 结果统计
