@@ -95,12 +95,12 @@ def run_task_2_scienceqa():
 
         gt = options_map[correct_idx]
 
-        # 1. 构造 Prompt (使用中文并强调只输出字母)
+        # 1. 构造 Prompt (使用英文，并强制添加前缀 "The answer is ")
         choices_str = "\n".join([f"{options_map[i]}. {c}" for i, c in enumerate(choices)])
         prompt_text = (
-            f"问题: {question}\n"
-            f"选项:\n{choices_str}\n"
-            "请根据图片和问题，从选项中选择一个最合适的答案。仅输出最终的选项字母（A/B/C/D/E），不要包含任何解释。"
+            f"Question: {question}\n"
+            f"Options:\n{choices_str}\n"
+            "Please select the correct option letter from A, B, C, D, or E. The answer is " # 【关键调整】引导前缀
         )
 
         # 2. 构建 Qwen2-VL 专用的多模态输入格式
@@ -128,18 +128,17 @@ def run_task_2_scienceqa():
             return_tensors="pt",
         ).to(model.device)
 
-        # 5. 生成结果 【关键修复点二：设置 temperature=0.01 强制确定性输出】
-        output_ids = model.generate(**inputs, max_new_tokens=64, temperature=0.01) 
+        # 5. 生成结果 (保持 temperature=0.01)
+        output_ids = model.generate(**inputs, max_new_tokens=10, temperature=0.01) # 【调整】max_new_tokens 设得更小
 
         # 6. 解码生成的 token
-        response = processor.batch_decode(
-            output_ids,
-            skip_special_tokens=True
-        )[0]
+        # 只解码模型实际生成的部分 (不包含输入 prompt 的 token)
+        input_len = inputs.input_ids.shape[1]
+        response_ids = output_ids[0, input_len:]
+        response = processor.decode(response_ids, skip_special_tokens=True).strip()
 
-        # 7. 正则提取预测答案
-        # 提取第一个出现的 A-E 字母
-        match = re.search(r"\b([A-E])\b", response.strip())
+        # 7. 正则提取预测答案 【关键调整】使用最简单的正则，捕捉第一个大写字母
+        match = re.search(r'([A-E])', response) 
         pred = match.group(1) if match else "None"
 
         if pred == gt:
