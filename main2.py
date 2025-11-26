@@ -3,6 +3,9 @@ import re
 import random
 import numpy as np
 from datasets import load_dataset
+# === 修复点：导入 PIL 库中的 Image 类 ===
+from PIL import Image
+# ========================================
 from transformers import (
     AutoProcessor,
     AutoModelForVision2Seq,
@@ -60,6 +63,7 @@ def run_task_2_scienceqa():
     )
 
     try:
+        # 注意：AutoModelForVision2Seq已被警告弃用，但为了与您现有代码兼容，暂不更改。
         model = AutoModelForVision2Seq.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
@@ -106,6 +110,7 @@ def run_task_2_scienceqa():
         text = prompt  # 直接将 prompt 作为文本输入
 
         # 3. 确保图像格式是 PIL，并且尺寸符合模型要求
+        # 此处的 Image.Image 检查依赖于上述的 'from PIL import Image'
         if isinstance(image, Image.Image):
             image = image.convert("RGB")  # 确保图像是 RGB 格式
         else:
